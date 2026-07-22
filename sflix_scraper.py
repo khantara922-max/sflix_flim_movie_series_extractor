@@ -1,36 +1,38 @@
 """
-SFlix Movie-Series API Extractor
-==================================
-Calls the SFlix internal REST API directly with requests — no browser needed.
+SFlix Movie-Series HTML Scraper
+=================================
+Scrapes movie detail URLs directly from the SSR HTML pages at
+https://sflix.film/movie-series using requests + BeautifulSoup.
 
-Endpoint:
-  GET https://sflix.film/wefeed-h5api-bff/subject/filter
-  ?subjectType=MOVIE&pageNum={page}&pageSize=36&sortField=LATEST
+The page renders all <a href="/detail/..."> links server-side, so no
+browser or internal API access is needed. We paginate by appending
+?page=N to the URL.
 
 Saves results to  full_movie_urls.txt
 
 Requirements:
-    pip install requests
+    pip install requests beautifulsoup4
 
 Usage:
-    python sflix_scraper.py                        # all pages (auto-stops when empty)
+    python sflix_scraper.py
     python sflix_scraper.py --start 1 --end 50
     python sflix_scraper.py --out my_movies.txt
 """
 
 import argparse
+import re
 import sys
 import time
 from typing import Optional
 
 import requests
+from bs4 import BeautifulSoup
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_URL    = "https://sflix.film"
-API_URL     = "https://sflix.film/wefeed-h5api-bff/subject/filter"
+LIST_URL    = "https://sflix.film/movie-series"
 DEFAULT_OUT = "full_movie_urls.txt"
-PAGE_SIZE   = 36
-DELAY       = 1.0   # seconds between requests — be polite
+DELAY       = 1.5   # seconds between page requests
 
 HEADERS = {
     "User-Agent": (
@@ -38,119 +40,130 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept":          "application/json, text/plain, */*",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer":         "https://sflix.film/movie-series",
-    "Origin":          "https://sflix.film",
+    "Referer":         "https://sflix.film/",
 }
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+# ── Scraping helpers ──────────────────────────────────────────────────────────
 
-def fetch_page(session: requests.Session, page: int) -> Optional[dict]:
-    """Fetch one page from the filter API. Returns parsed JSON or None on error."""
-    params = {
-        "subjectType": "MOVIE",
-        "pageNum":     page,
-        "pageSize":    PAGE_SIZE,
-        "sortField":   "LATEST",
-    }
+def fetch_page_html(session: requests.Session, page: int) -> Optional[str]:
+    """Fetch raw HTML for a given page number."""
+    url = LIST_URL if page == 1 else f"{LIST_URL}?page={page}"
     try:
-        resp = session.get(API_URL, params=params, headers=HEADERS, timeout=20)
+        resp = session.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        return resp.json()
+        return resp.text
     except requests.exceptions.RequestException as e:
         print(f"    [!] Request error on page {page}: {e}", file=sys.stderr)
         return None
-    except ValueError:
-        print(f"    [!] JSON decode error on page {page}", file=sys.stderr)
-        return None
 
 
-def parse_urls(data: dict) -> list:
-    """Extract full movie detail URLs from an API response."""
+def parse_movie_urls(html: str) -> list:
+    """
+    Extract all /detail/... href values from the page HTML.
+    Works on both BeautifulSoup parsing and regex fallback.
+    """
     urls = []
-    # try both known response shapes
-    items = (
-        data.get("data", {}).get("items", [])
-        or data.get("data", {}).get("subjectList", {}).get("items", [])
-    )
-    for item in items:
-        path = item.get("detailPath") or item.get("detailpath", "")
-        if not path:
-            continue
-        if path.startswith("http"):
-            urls.append(path)
-        else:
-            if not path.startswith("/"):
-                path = "/detail/" + path
-            urls.append(BASE_URL + path)
+    seen = set()
+
+    # Primary: BeautifulSoup
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=re.compile(r"/detail/")):
+            href = a.get("href", "")
+            # strip query params and fragments
+            path = href.split("?")[0].split("#")[0]
+            if path and path not in seen:
+                seen.add(path)
+                full = path if path.startswith("http") else BASE_URL + path
+                urls.append(full)
+    except Exception:
+        pass
+
+    # Fallback: regex if BS4 finds nothing
+    if not urls:
+        for match in re.finditer(r'href="(/detail/[^"?#]+)', html):
+            path = match.group(1)
+            if path not in seen:
+                seen.add(path)
+                urls.append(BASE_URL + path)
+
     return urls
 
 
-def get_total_pages(data: dict) -> Optional[int]:
-    """Try to read total page count from the API pager info."""
-    pager = data.get("data", {}).get("pager", {})
-    total_items = pager.get("total") or pager.get("totalCount")
-    if total_items:
-        return (int(total_items) + PAGE_SIZE - 1) // PAGE_SIZE
-    return None
+def has_next_page(html: str, current_page: int) -> bool:
+    """
+    Check if there is a next page by looking for a page=N+1 link
+    or a 'see more' / pagination element in the HTML.
+    """
+    next_page = current_page + 1
+    return (
+        f"page={next_page}" in html
+        or "see more" in html.lower()
+        or "see-more" in html.lower()
+        or "loadmore" in html.lower()
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(start: int, end: Optional[int], out: str):
-    all_urls: dict = {}   # {url: True} — ordered, deduplicated
+    all_urls: dict = {}   # {url: True} — ordered + deduplicated
 
-    print("SFlix API Movie Extractor  (no browser needed)")
-    print(f"  Endpoint : {API_URL}")
+    print("SFlix HTML Movie Scraper  (requests + BeautifulSoup)")
+    print(f"  Source   : {LIST_URL}")
     print(f"  Output   : {out}")
     print()
 
     session = requests.Session()
     page    = start
-    total   = None   # discovered from first response
+    consecutive_empty = 0
 
     while True:
-        # stop if we've hit the user-supplied end page
+        # stop at user-supplied end page
         if end is not None and page > end:
             break
 
-        print(f"  Page {page}", end="", flush=True)
-        if total:
-            print(f"/{total}", end="", flush=True)
-        print(" ...", end=" ", flush=True)
+        print(f"  Page {page} ...", end=" ", flush=True)
 
-        data = fetch_page(session, page)
+        html = fetch_page_html(session, page)
 
-        if data is None:
-            print("error — skipping")
+        if html is None:
+            print("fetch failed — skipping")
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                print("  3 consecutive failures — stopping.")
+                break
             page += 1
             time.sleep(DELAY)
             continue
 
-        # discover total pages from first successful response
-        if total is None:
-            total = get_total_pages(data)
-            if total:
-                print(f"(total pages: {total}) ", end="", flush=True)
-                # cap end to actual total if not user-supplied
-                if end is None:
-                    end = total
-
-        urls = parse_urls(data)
+        urls = parse_movie_urls(html)
 
         if not urls:
-            print("empty — stopping.")
-            break
+            print("no URLs found — stopping.")
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                break
+            page += 1
+            time.sleep(DELAY)
+            continue
 
+        consecutive_empty = 0
         new = 0
         for u in urls:
             if u not in all_urls:
                 all_urls[u] = True
                 new += 1
 
-        print(f"{len(urls)} items (+{new} new)  total: {len(all_urls)}")
+        print(f"{len(urls)} found (+{new} new)  total: {len(all_urls)}")
+
+        # stop if no more pages
+        if not has_next_page(html, page):
+            print("  No next page detected — done.")
+            break
 
         page += 1
         time.sleep(DELAY)
@@ -170,20 +183,14 @@ def run(start: int, end: Optional[int], out: str):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Extract SFlix movie URLs via direct API calls (no browser)."
+        description="Scrape SFlix movie URLs from HTML pages (no browser needed)."
     )
-    p.add_argument(
-        "--start", type=int, default=1,
-        help="First page to fetch (default: 1)"
-    )
-    p.add_argument(
-        "--end", type=int, default=None,
-        help="Last page to fetch inclusive (default: auto — stops when API returns empty)"
-    )
-    p.add_argument(
-        "--out", type=str, default=DEFAULT_OUT,
-        help=f"Output file (default: {DEFAULT_OUT})"
-    )
+    p.add_argument("--start", type=int, default=1,
+                   help="First page (default: 1)")
+    p.add_argument("--end",   type=int, default=None,
+                   help="Last page inclusive (default: auto-detect)")
+    p.add_argument("--out",   type=str, default=DEFAULT_OUT,
+                   help=f"Output file (default: {DEFAULT_OUT})")
     return p.parse_args()
 
 
