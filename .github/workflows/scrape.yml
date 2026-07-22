@@ -11,37 +11,31 @@ jobs:
     timeout-minutes: 30
 
     permissions:
-      contents: write         # allow pushing results back to repo
+      contents: write
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. Python ───────────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Install deps ─────────────────────────────────────────────────────
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests beautifulsoup4
 
-      # ── 4. Run scraper ──────────────────────────────────────────────────────
       - name: Run SFlix scraper
         run: python sflix_scraper.py --out full_movie_urls.txt
 
-      # ── 5. Write run metadata ────────────────────────────────────────────────
       - name: Write last-run info
         run: |
           COUNT=$(wc -l < full_movie_urls.txt | tr -d ' ')
           echo "Last run  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >  last_run.txt
           echo "URL count : $COUNT"                               >> last_run.txt
 
-      # ── 6. Commit & push ────────────────────────────────────────────────────
       - name: Commit and push results
         run: |
           git config user.name  "github-actions[bot]"
